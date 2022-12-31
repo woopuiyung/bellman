@@ -28,10 +28,8 @@ use rand_core::OsRng;
 #[cfg(feature = "multicore")]
 use rayon::{iter::ParallelIterator, prelude::ParallelSlice};
 
-use crate::{
-    groth16::{PreparedVerifyingKey, Proof, VerifyingKey},
-    VerificationError,
-};
+use super::{PreparedVerifyingKey, Proof, VerifyingKey};
+use crate::VerificationError;
 
 /// A batch verification item.
 ///
