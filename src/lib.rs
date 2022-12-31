@@ -141,6 +141,8 @@ pub mod domain;
 pub mod gadgets;
 #[cfg(feature = "groth16")]
 pub mod groth16;
+#[cfg(feature = "mirage")]
+pub mod mirage;
 pub mod multicore;
 pub mod multiexp;
 

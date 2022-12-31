@@ -39,8 +39,9 @@ sha2 = "0.10"
 
 [features]
 groth16 = ["pairing"]
+mirage = ["pairing"]
 multicore = ["crossbeam-channel", "lazy_static", "log", "num_cpus", "rayon", "rand_core/getrandom"]
-default = ["groth16", "multicore"]
+default = ["groth16", "multicore", "mirage"]
 
 [[test]]
 name = "mimc"
