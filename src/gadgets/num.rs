@@ -9,8 +9,8 @@ use super::Assignment;
 use super::boolean::{self, AllocatedBit, Boolean};
 
 pub struct AllocatedNum<Scalar: PrimeField> {
-    value: Option<Scalar>,
-    variable: Variable,
+    pub value: Option<Scalar>,
+    pub variable: Variable,
 }
 
 impl<Scalar: PrimeField> Clone for AllocatedNum<Scalar> {

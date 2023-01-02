@@ -278,6 +278,8 @@ fn test_xordemo() {
     assert_eq!(delta, params.vk.delta_g2);
 
     let pvk = prepare_verifying_key(&params.vk);
+    assert_eq!(-delta.clone(), pvk.neg_delta_g2);
+    assert_eq!(-gamma.clone(), pvk.neg_gamma_g2);
 
     let r = Fr::from(27134);
     let s = Fr::from(17146);

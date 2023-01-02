@@ -145,6 +145,7 @@ pub mod groth16;
 pub mod mirage;
 pub mod multicore;
 pub mod multiexp;
+pub mod cc;
 
 use ff::PrimeField;
 

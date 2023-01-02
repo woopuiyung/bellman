@@ -6,9 +6,10 @@ use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve, Group, Wnaf, WnafGroup};
 use pairing::Engine;
 
-use super::{Parameters, VerifyingKey};
+use super::{Parameters, VerifyingKey, TranscriptEntry};
 
-use crate::{Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
+use crate::cc::{CcCircuit, CcConstraintSystem};
+use crate::{ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
 
 use crate::domain::{EvaluationDomain, Scalar};
 
@@ -24,7 +25,7 @@ where
     E: Engine,
     E::G1: WnafGroup,
     E::G2: WnafGroup,
-    C: Circuit<E::Fr>,
+    C: CcCircuit<E::Fr>,
     R: RngCore,
 {
     let g1 = E::G1::random(&mut rng);
@@ -32,10 +33,13 @@ where
     let alpha = E::Fr::random(&mut rng);
     let beta = E::Fr::random(&mut rng);
     let gamma = E::Fr::random(&mut rng);
-    let delta = E::Fr::random(&mut rng);
+    let num_aux_blocks = circuit.num_aux_blocks();
+    let deltas: Vec<E::Fr> = (0..=num_aux_blocks)
+        .map(|_| E::Fr::random(&mut rng))
+        .collect();
     let tau = E::Fr::random(&mut rng);
 
-    generate_parameters::<E, C>(circuit, g1, g2, alpha, beta, gamma, delta, tau)
+    generate_parameters::<E, C>(circuit, g1, g2, alpha, beta, gamma, deltas, tau)
 }
 
 /// This is our assembly structure that we'll use to synthesize the
@@ -50,6 +54,11 @@ struct KeypairAssembly<Scalar: PrimeField> {
     at_aux: Vec<Vec<(Scalar, usize)>>,
     bt_aux: Vec<Vec<(Scalar, usize)>>,
     ct_aux: Vec<Vec<(Scalar, usize)>>,
+    /// The length of this is equal to the number of aux blocks.
+    /// Each entry indicates the first aux index *after* the block.
+    aux_block_indices: Vec<usize>,
+    /// Transcript events
+    transcript: Vec<TranscriptEntry>,
 }
 
 impl<Scalar: PrimeField> ConstraintSystem<Scalar> for KeypairAssembly<Scalar> {
@@ -89,6 +98,7 @@ impl<Scalar: PrimeField> ConstraintSystem<Scalar> for KeypairAssembly<Scalar> {
         self.at_inputs.push(vec![]);
         self.bt_inputs.push(vec![]);
         self.ct_inputs.push(vec![]);
+        self.transcript.push(TranscriptEntry::PublicInput);
 
         Ok(Variable(Index::Input(index)))
     }
@@ -154,6 +164,32 @@ impl<Scalar: PrimeField> ConstraintSystem<Scalar> for KeypairAssembly<Scalar> {
     }
 }
 
+impl<Scalar: PrimeField> CcConstraintSystem<Scalar> for KeypairAssembly<Scalar> {
+    fn end_aux_block<A, AR>(&mut self, _: A) -> Result<(), SynthesisError>
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        self.aux_block_indices.push(self.num_aux);
+        self.transcript.push(TranscriptEntry::AuxCommit);
+        Ok(())
+    }
+
+    fn alloc_random<A, AR>(
+        &mut self,
+        annotation: A,
+    ) -> Result<(Variable, Option<Scalar>), SynthesisError>
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        let var = self.alloc_input(annotation, || Err(SynthesisError::AssignmentMissing))?;
+        self.transcript.pop();
+        self.transcript.push(TranscriptEntry::Coin);
+        Ok((var, None))
+    }
+}
+
 /// Create parameters for a circuit, given some toxic waste.
 #[allow(clippy::too_many_arguments)]
 pub fn generate_parameters<E, C>(
@@ -163,15 +199,16 @@ pub fn generate_parameters<E, C>(
     alpha: E::Fr,
     beta: E::Fr,
     gamma: E::Fr,
-    delta: E::Fr,
+    deltas: Vec<E::Fr>,
     tau: E::Fr,
 ) -> Result<Parameters<E>, SynthesisError>
 where
     E: Engine,
     E::G1: WnafGroup,
     E::G2: WnafGroup,
-    C: Circuit<E::Fr>,
+    C: CcCircuit<E::Fr>,
 {
+    assert_eq!(deltas.len(), circuit.num_aux_blocks() + 1);
     let mut assembly = KeypairAssembly {
         num_inputs: 0,
         num_aux: 0,
@@ -182,10 +219,13 @@ where
         at_aux: vec![],
         bt_aux: vec![],
         ct_aux: vec![],
+        aux_block_indices: vec![],
+        transcript: vec![],
     };
 
     // Allocate the "one" input variable
     assembly.alloc_input(|| "", || Ok(E::Fr::one()))?;
+    assembly.transcript.pop();
 
     // Synthesize the circuit.
     circuit.synthesize(&mut assembly)?;
@@ -228,14 +268,17 @@ where
             Err(SynthesisError::UnexpectedIdentity)
         }
     }?;
-    let delta_inverse = {
-        let inverse = delta.invert();
-        if bool::from(inverse.is_some()) {
-            Ok(inverse.unwrap())
-        } else {
-            Err(SynthesisError::UnexpectedIdentity)
-        }
-    }?;
+    let deltas_inverse = deltas
+        .iter()
+        .map(|delta| {
+            let inverse = delta.invert();
+            if bool::from(inverse.is_some()) {
+                Ok(inverse.unwrap())
+            } else {
+                Err(SynthesisError::UnexpectedIdentity)
+            }
+        })
+        .collect::<Result<Vec<E::Fr>, _>>()?;
 
     let worker = Worker::new();
 
@@ -260,7 +303,7 @@ where
 
         // coeff = t(x) / delta
         let mut coeff = powers_of_tau.z(&tau);
-        coeff.mul_assign(&delta_inverse);
+        coeff.mul_assign(&deltas_inverse[deltas_inverse.len() - 1]);
 
         // Compute the H query with multiple threads
         worker.scope(h.len(), |scope, chunk| {
@@ -299,7 +342,7 @@ where
     let mut b_g1 = vec![E::G1Affine::identity(); assembly.num_inputs + assembly.num_aux];
     let mut b_g2 = vec![E::G2Affine::identity(); assembly.num_inputs + assembly.num_aux];
     let mut ic = vec![E::G1Affine::identity(); assembly.num_inputs];
-    let mut l = vec![E::G1Affine::identity(); assembly.num_aux];
+    let mut ls = vec![];
 
     #[allow(clippy::too_many_arguments)]
     fn eval<E: Engine>(
@@ -438,49 +481,75 @@ where
         &worker,
     );
 
-    // Evaluate for auxiliary variables.
-    eval::<E>(
-        &g1_wnaf,
-        &g2_wnaf,
-        &powers_of_tau,
-        &assembly.at_aux,
-        &assembly.bt_aux,
-        &assembly.ct_aux,
-        &mut a[assembly.num_inputs..],
-        &mut b_g1[assembly.num_inputs..],
-        &mut b_g2[assembly.num_inputs..],
-        &mut l,
-        &delta_inverse,
-        &alpha,
-        &beta,
-        &worker,
-    );
+    for i in 0..deltas.len() {
+        let start = if i == 0 {
+            0
+        } else {
+            assembly.aux_block_indices[i - 1]
+        };
+        let end = if i + 1 == deltas.len() {
+            assembly.num_aux
+        } else {
+            assembly.aux_block_indices[i]
+        };
+        let n_inputs = assembly.num_inputs;
+        let mut l = vec![E::G1Affine::identity(); end - start];
+        // Evaluate for auxiliary variables.
+        eval::<E>(
+            &g1_wnaf,
+            &g2_wnaf,
+            &powers_of_tau,
+            &assembly.at_aux[start..end],
+            &assembly.bt_aux[start..end],
+            &assembly.ct_aux[start..end],
+            &mut a[n_inputs + start..n_inputs + end],
+            &mut b_g1[n_inputs + start..n_inputs + end],
+            &mut b_g2[n_inputs + start..n_inputs + end],
+            &mut l,
+            &deltas_inverse[i],
+            &alpha,
+            &beta,
+            &worker,
+        );
+        ls.push(Arc::new(l));
+    }
 
     // Don't allow any elements be unconstrained, so that
     // the L query is always fully dense.
-    for e in l.iter() {
-        if e.is_identity().into() {
-            return Err(SynthesisError::UnconstrainedVariable);
+    for l in &ls {
+        for e in l.iter() {
+            if e.is_identity().into() {
+                return Err(SynthesisError::UnconstrainedVariable);
+            }
         }
     }
 
     let g1 = g1.to_affine();
     let g2 = g2.to_affine();
+    let deltas_g1 = deltas
+        .iter()
+        .map(|delta| (g1 * delta).to_affine())
+        .collect::<Vec<_>>();
+    let deltas_g2 = deltas
+        .iter()
+        .map(|delta| (g2 * delta).to_affine())
+        .collect::<Vec<_>>();
 
     let vk = VerifyingKey::<E> {
         alpha_g1: (g1 * alpha).to_affine(),
         beta_g1: (g1 * beta).to_affine(),
         beta_g2: (g2 * beta).to_affine(),
         gamma_g2: (g2 * gamma).to_affine(),
-        delta_g1: (g1 * delta).to_affine(),
-        delta_g2: (g2 * delta).to_affine(),
+        deltas_g1,
+        deltas_g2,
         ic,
+        transcript: assembly.transcript,
     };
 
     Ok(Parameters {
         vk,
         h: Arc::new(h),
-        l: Arc::new(l),
+        ls,
 
         // Filter points at infinity away from A/B queries
         a: Arc::new(

@@ -3,12 +3,16 @@ use std::ops::{AddAssign, MulAssign};
 use std::sync::Arc;
 
 use ff::{Field, PrimeField, PrimeFieldBits};
-use group::{prime::PrimeCurveAffine, Curve};
+use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
+use merlin::Transcript;
 use pairing::Engine;
 
-use super::{ParameterSource, Proof};
+use super::{VerifyingKey, ParameterSource, Proof, merlin_rng};
 
-use crate::{Circuit, ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
+use crate::{
+    cc::{CcCircuit, CcConstraintSystem},
+    ConstraintSystem, Index, LinearCombination, SynthesisError, Variable,
+};
 
 use crate::domain::{EvaluationDomain, Scalar};
 
@@ -54,28 +58,41 @@ fn eval<S: PrimeField>(
     acc
 }
 
-struct ProvingAssignment<S: PrimeField> {
+struct ProvingAssignment<'p, E: Engine, P: ParameterSource<E> + 'p> {
     // Density of queries
     a_aux_density: DensityTracker,
     b_input_density: DensityTracker,
     b_aux_density: DensityTracker,
 
     // Evaluations of A, B, C polynomials
-    a: Vec<Scalar<S>>,
-    b: Vec<Scalar<S>>,
-    c: Vec<Scalar<S>>,
+    a: Vec<Scalar<E::Fr>>,
+    b: Vec<Scalar<E::Fr>>,
+    c: Vec<Scalar<E::Fr>>,
 
     // Assignments of variables
-    input_assignment: Vec<S>,
-    aux_assignment: Vec<S>,
+    input_assignment: Vec<E::Fr>,
+    aux_assignment: Vec<E::Fr>,
+
+    // proof randomness
+    kappa_3s: Vec<E::Fr>,
+    pi_ds: Vec<E::G1Affine>,
+    vk: &'p VerifyingKey<E>,
+    params: &'p mut P,
+
+    /// The length of this is equal to the number of aux blocks.
+    /// Each entry indicates the first aux index *after* the block.
+    aux_block_indices: Vec<usize>,
+    transcript: Transcript,
 }
 
-impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
+impl<'p, E: Engine, P: ParameterSource<E> + 'p> ConstraintSystem<E::Fr>
+    for ProvingAssignment<'p, E, P>
+{
     type Root = Self;
 
     fn alloc<F, A, AR>(&mut self, _: A, f: F) -> Result<Variable, SynthesisError>
     where
-        F: FnOnce() -> Result<S, SynthesisError>,
+        F: FnOnce() -> Result<E::Fr, SynthesisError>,
         A: FnOnce() -> AR,
         AR: Into<String>,
     {
@@ -88,11 +105,12 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
 
     fn alloc_input<F, A, AR>(&mut self, _: A, f: F) -> Result<Variable, SynthesisError>
     where
-        F: FnOnce() -> Result<S, SynthesisError>,
+        F: FnOnce() -> Result<E::Fr, SynthesisError>,
         A: FnOnce() -> AR,
         AR: Into<String>,
     {
         self.input_assignment.push(f()?);
+        self.transcript.append_message(b"input", self.input_assignment.last().unwrap().to_repr().as_ref());
         self.b_input_density.add_element();
 
         Ok(Variable(Index::Input(self.input_assignment.len() - 1)))
@@ -102,9 +120,9 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
     where
         A: FnOnce() -> AR,
         AR: Into<String>,
-        LA: FnOnce(LinearCombination<S>) -> LinearCombination<S>,
-        LB: FnOnce(LinearCombination<S>) -> LinearCombination<S>,
-        LC: FnOnce(LinearCombination<S>) -> LinearCombination<S>,
+        LA: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>,
+        LB: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>,
+        LC: FnOnce(LinearCombination<E::Fr>) -> LinearCombination<E::Fr>,
     {
         let a = a(LinearCombination::zero());
         let b = b(LinearCombination::zero());
@@ -157,6 +175,58 @@ impl<S: PrimeField> ConstraintSystem<S> for ProvingAssignment<S> {
     }
 }
 
+impl<'p, E: Engine, P: ParameterSource<E> + 'p> CcConstraintSystem<E::Fr>
+    for ProvingAssignment<'p, E, P>
+where
+    E::Fr: PrimeFieldBits,
+{
+    fn alloc_random<A, AR>(
+        &mut self,
+        annotation: A,
+    ) -> Result<(Variable, Option<E::Fr>), SynthesisError>
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        let mut rng = merlin_rng(&mut self.transcript, b"random");
+        let value = E::Fr::random(&mut *rng);
+        let var = self.alloc_input(annotation, || Ok(value.clone()))?;
+        Ok((var, Some(value)))
+    }
+
+    fn end_aux_block<A, AR>(&mut self, _annotation: A) -> Result<(), SynthesisError>
+    where
+        A: FnOnce() -> AR,
+        AR: Into<String>,
+    {
+        let worker = Worker::new();
+        let i = self.aux_block_indices.len();
+        let start = self.aux_block_indices.last().copied().unwrap_or(0);
+        let end = self.aux_assignment.len();
+        assert!(end > start);
+        let aux_assignment = Arc::new(
+            self.aux_assignment[start..end]
+                .into_iter()
+                .map(|s| s.clone().into())
+                .collect::<Vec<_>>(),
+        );
+        let mut pi_d: E::G1 = multiexp(
+            &worker,
+            self.params
+                .get_l(end - start, i)?,
+            FullDensity,
+            aux_assignment,
+        ).wait()?;
+        // [ J_i(s)/delta_i + delta_last * k_i ]_1
+        AddAssign::<&E::G1>::add_assign(&mut pi_d, &(self.vk.deltas_g1.last().unwrap().clone() * self.kappa_3s[i]));
+        let pi_d = pi_d.to_affine();
+        self.transcript.append_message(b"aux_commit", pi_d.to_uncompressed().as_ref());
+        self.pi_ds.push(pi_d);
+        self.aux_block_indices.push(self.aux_assignment.len());
+        Ok(())
+    }
+}
+
 pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     circuit: C,
     params: P,
@@ -165,13 +235,15 @@ pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
 where
     E: Engine,
     E::Fr: PrimeFieldBits,
-    C: Circuit<E::Fr>,
+    C: CcCircuit<E::Fr>,
     R: RngCore,
 {
     let r = E::Fr::random(&mut rng);
     let s = E::Fr::random(&mut rng);
+    let num_kappa_3s = circuit.num_aux_blocks();
+    let kappa_3s: Vec<_> = (0..num_kappa_3s).map(|_| E::Fr::random(&mut rng)).collect();
 
-    create_proof::<E, C, P>(circuit, params, r, s)
+    create_proof::<E, C, P>(circuit, params, r, s, kappa_3s)
 }
 
 #[allow(clippy::many_single_char_names)]
@@ -180,12 +252,18 @@ pub fn create_proof<E, C, P: ParameterSource<E>>(
     mut params: P,
     r: E::Fr,
     s: E::Fr,
+    kappa_3s: Vec<E::Fr>,
 ) -> Result<Proof<E>, SynthesisError>
 where
     E: Engine,
     E::Fr: PrimeFieldBits,
-    C: Circuit<E::Fr>,
+    C: CcCircuit<E::Fr>,
 {
+    assert_eq!(kappa_3s.len(), circuit.num_aux_blocks());
+
+    // we're assuming the arg doesn't matter
+    let vk = params.get_vk(1337)?;
+
     let mut prover = ProvingAssignment {
         a_aux_density: DensityTracker::new(),
         b_input_density: DensityTracker::new(),
@@ -193,8 +271,14 @@ where
         a: vec![],
         b: vec![],
         c: vec![],
+        kappa_3s: kappa_3s.clone(),
+        params: &mut params,
+        vk: &vk,
+        pi_ds: vec![],
         input_assignment: vec![],
         aux_assignment: vec![],
+        aux_block_indices: vec![],
+        transcript: Transcript::new(b"mirage_aozdemir_1"),
     };
 
     prover.alloc_input(|| "", || Ok(E::Fr::one()))?;
@@ -206,8 +290,6 @@ where
     }
 
     let worker = Worker::new();
-
-    let vk = params.get_vk(prover.input_assignment.len())?;
 
     let h = {
         let mut a = EvaluationDomain::from_coeffs(prover.a)?;
@@ -232,7 +314,7 @@ where
         // TODO: parallelize if it's even helpful
         let a = Arc::new(a.into_iter().map(|s| s.0.into()).collect::<Vec<_>>());
 
-        multiexp(&worker, params.get_h(a.len())?, FullDensity, a)
+        multiexp(&worker, prover.params.get_h(a.len())?, FullDensity, a)
     };
 
     // TODO: parallelize if it's even helpful
@@ -243,6 +325,16 @@ where
             .map(|s| s.into())
             .collect::<Vec<_>>(),
     );
+    let final_block_aux_assignment = Arc::new({
+        let start = prover.aux_block_indices.last().cloned().unwrap_or(0);
+        prover
+            .aux_assignment[start..]
+            .iter()
+            .cloned()
+            .into_iter()
+            .map(|s| s.into())
+            .collect::<Vec<_>>()
+    });
     let aux_assignment = Arc::new(
         prover
             .aux_assignment
@@ -253,15 +345,15 @@ where
 
     let l = multiexp(
         &worker,
-        params.get_l(aux_assignment.len())?,
+        prover.params.get_l(final_block_aux_assignment.len(), prover.aux_block_indices.len())?,
         FullDensity,
-        aux_assignment.clone(),
+        final_block_aux_assignment.clone(),
     );
 
     let a_aux_density_total = prover.a_aux_density.get_total_density();
 
     let (a_inputs_source, a_aux_source) =
-        params.get_a(input_assignment.len(), a_aux_density_total)?;
+        prover.params.get_a(input_assignment.len(), a_aux_density_total)?;
 
     let a_inputs = multiexp(
         &worker,
@@ -282,7 +374,7 @@ where
     let b_aux_density_total = b_aux_density.get_total_density();
 
     let (b_g1_inputs_source, b_g1_aux_source) =
-        params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+        prover.params.get_b_g1(b_input_density_total, b_aux_density_total)?;
 
     let b_g1_inputs = multiexp(
         &worker,
@@ -298,7 +390,7 @@ where
     );
 
     let (b_g2_inputs_source, b_g2_aux_source) =
-        params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+        prover.params.get_b_g2(b_input_density_total, b_aux_density_total)?;
 
     let b_g2_inputs = multiexp(
         &worker,
@@ -308,22 +400,28 @@ where
     );
     let b_g2_aux = multiexp(&worker, b_g2_aux_source, b_aux_density, aux_assignment);
 
-    if bool::from(vk.delta_g1.is_identity() | vk.delta_g2.is_identity()) {
-        // If this element is zero, someone is trying to perform a
-        // subversion-CRS attack.
-        return Err(SynthesisError::UnexpectedIdentity);
+    for i in 0..vk.deltas_g1.len() {
+        if bool::from(vk.deltas_g1[i].is_identity() | vk.deltas_g2[i].is_identity()) {
+            // If this element is zero, someone is trying to perform a
+            // subversion-CRS attack.
+            return Err(SynthesisError::UnexpectedIdentity);
+        }
     }
 
-    let mut g_a = vk.delta_g1 * r;
+    let last = vk.deltas_g1.len() - 1;
+    let mut g_a = vk.deltas_g1[last] * r;
     AddAssign::<&E::G1Affine>::add_assign(&mut g_a, &vk.alpha_g1);
-    let mut g_b = vk.delta_g2 * s;
+    let mut g_b = vk.deltas_g2[last] * s;
     AddAssign::<&E::G2Affine>::add_assign(&mut g_b, &vk.beta_g2);
     let mut g_c;
     {
         let mut rs = r;
         rs.mul_assign(&s);
 
-        g_c = vk.delta_g1 * rs;
+        g_c = vk.deltas_g1[last] * rs;
+        for i in 0..kappa_3s.len() {
+            AddAssign::<&E::G1>::add_assign(&mut g_c, &(-vk.deltas_g1[i] * kappa_3s[i]));
+        }
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.alpha_g1 * s));
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.beta_g1 * r));
     }
@@ -348,5 +446,6 @@ where
         a: g_a.to_affine(),
         b: g_b.to_affine(),
         c: g_c.to_affine(),
+        ds: prover.pi_ds,
     })
 }

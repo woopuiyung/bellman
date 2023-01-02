@@ -6,7 +6,8 @@ use self::dummy_engine::*;
 use std::marker::PhantomData;
 use std::ops::{AddAssign, MulAssign, SubAssign};
 
-use crate::{Circuit, ConstraintSystem, SynthesisError};
+use crate::cc::{CcCircuit, CcConstraintSystem};
+use crate::SynthesisError;
 
 use super::{create_proof, generate_parameters, prepare_verifying_key, verify_proof};
 
@@ -16,8 +17,8 @@ struct XorDemo<Scalar: PrimeField> {
     _marker: PhantomData<Scalar>,
 }
 
-impl<Scalar: PrimeField> Circuit<Scalar> for XorDemo<Scalar> {
-    fn synthesize<CS: ConstraintSystem<Scalar>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+impl<Scalar: PrimeField> CcCircuit<Scalar> for XorDemo<Scalar> {
+    fn synthesize<CS: CcConstraintSystem<Scalar>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let a_var = cs.alloc(
             || "a",
             || {
@@ -86,6 +87,10 @@ impl<Scalar: PrimeField> Circuit<Scalar> for XorDemo<Scalar> {
 
         Ok(())
     }
+
+    fn num_aux_blocks(&self) -> usize {
+        0
+    }
 }
 
 #[test]
@@ -105,7 +110,8 @@ fn test_xordemo() {
             _marker: PhantomData,
         };
 
-        generate_parameters::<DummyEngine, _>(c, g1, g2, alpha, beta, gamma, delta, tau).unwrap()
+        generate_parameters::<DummyEngine, _>(c, g1, g2, alpha, beta, gamma, vec![delta], tau)
+            .unwrap()
     };
 
     // This will synthesize the constraint system:
@@ -176,7 +182,7 @@ fn test_xordemo() {
     assert_eq!(2, params.vk.ic.len());
 
     // The density of the L query is 2 (2 aux variables)
-    assert_eq!(2, params.l.len());
+    assert_eq!(2, params.ls[0].len());
 
     // The density of the A query is 4 (each variable is in at least one A term)
     assert_eq!(4, params.a.len());
@@ -265,7 +271,7 @@ fn test_xordemo() {
             // Check the correctness of the L query elements
             tmp1.mul_assign(&delta_inverse);
 
-            assert_eq!(tmp1, params.l[i - 2]);
+            assert_eq!(tmp1, params.ls[0][i - 2]);
         }
     }
 
@@ -274,10 +280,12 @@ fn test_xordemo() {
     assert_eq!(beta, params.vk.beta_g1);
     assert_eq!(beta, params.vk.beta_g2);
     assert_eq!(gamma, params.vk.gamma_g2);
-    assert_eq!(delta, params.vk.delta_g1);
-    assert_eq!(delta, params.vk.delta_g2);
+    assert_eq!(delta, params.vk.deltas_g1[0]);
+    assert_eq!(delta, params.vk.deltas_g2[0]);
 
     let pvk = prepare_verifying_key(&params.vk);
+    assert_eq!(-delta.clone(), pvk.neg_deltas_g2[0]);
+    assert_eq!(-gamma.clone(), pvk.neg_gamma_g2);
 
     let r = Fr::from(27134);
     let s = Fr::from(17146);
@@ -289,7 +297,7 @@ fn test_xordemo() {
             _marker: PhantomData,
         };
 
-        create_proof(c, &params, r, s).unwrap()
+        create_proof(c, &params, r, s, vec![]).unwrap()
     };
 
     // A(x) =
@@ -360,7 +368,7 @@ fn test_xordemo() {
 
         // L query answer
         // a_2 = 1, a_3 = 0
-        expected_c.add_assign(&params.l[0]);
+        expected_c.add_assign(&params.ls[0][0]);
 
         // H query answer
         for (i, coeff) in [5040, 11763, 10755, 63633, 128, 9747, 8739]
@@ -376,6 +384,7 @@ fn test_xordemo() {
 
         assert_eq!(expected_c, proof.c);
     }
+    assert_eq!(proof.ds.len(), 0);
 
     assert!(verify_proof(&pvk, &proof, &[Fr::one()]).is_ok());
 }
@@ -388,8 +397,8 @@ struct MultWithZeroCoeffs<F> {
     one_var: bool,
 }
 
-impl<F: ff::PrimeField> Circuit<F> for &MultWithZeroCoeffs<F> {
-    fn synthesize<CS: ConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+impl<F: ff::PrimeField> CcCircuit<F> for &MultWithZeroCoeffs<F> {
+    fn synthesize<CS: CcConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         let a = cs.alloc(|| "a", || Ok(self.a.unwrap()))?;
         let b = cs.alloc(|| "b", || Ok(self.b.unwrap()))?;
         let c = cs.alloc(|| "c", || Ok(self.c.unwrap()))?;
@@ -412,6 +421,10 @@ impl<F: ff::PrimeField> Circuit<F> for &MultWithZeroCoeffs<F> {
         }
         Ok(())
     }
+
+    fn num_aux_blocks(&self) -> usize {
+        0
+    }
 }
 
 fn zero_coeff_test(one_var: bool) {
@@ -429,10 +442,11 @@ fn zero_coeff_test(one_var: bool) {
     let delta = Fr::from(5481);
     let tau = Fr::from(3673);
     let pk =
-        generate_parameters::<DummyEngine, _>(&m, g1, g2, alpha, beta, gamma, delta, tau).unwrap();
+        generate_parameters::<DummyEngine, _>(&m, g1, g2, alpha, beta, gamma, vec![delta], tau)
+            .unwrap();
     let r = Fr::from(27134);
     let s = Fr::from(17146);
-    let pf = create_proof(&m, &pk, r, s).unwrap();
+    let pf = create_proof(&m, &pk, r, s, vec![]).unwrap();
     let pvk = prepare_verifying_key(&pk.vk);
     verify_proof(&pvk, &pf, &[]).unwrap();
 }
@@ -445,4 +459,181 @@ fn zero_coeff_one_var() {
 #[test]
 fn zero_coeff_non_one_var() {
     zero_coeff_test(false);
+}
+
+#[test]
+fn coin1() {
+    struct Coin1<F> {
+        a: Vec<Option<F>>,
+        b: Vec<Option<F>>,
+    }
+
+    impl<F: ff::PrimeField> CcCircuit<F> for &Coin1<F> {
+        fn synthesize<CS: CcConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+            use crate::gadgets::num::AllocatedNum;
+            use crate::gadgets::Assignment;
+            let as_ = self
+                .a
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    AllocatedNum::alloc(cs.namespace(|| format!("a{}", i)), || {
+                        a.get().map(Clone::clone)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let bs_ = self
+                .b
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    AllocatedNum::alloc(cs.namespace(|| format!("b{}", i)), || {
+                        b.get().map(Clone::clone)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            cs.end_aux_block(|| "perms")?;
+            let (k, val_k) = cs.alloc_random(|| "k")?;
+            let k = AllocatedNum {
+                variable: k,
+                value: val_k,
+            };
+            let ak = as_
+                .into_iter()
+                .try_fold(k.clone(), |k, a| k.mul(cs.namespace(|| "mul"), &a))?;
+            let bk = bs_
+                .into_iter()
+                .try_fold(k, |k, b| k.mul(cs.namespace(|| "mul"), &b))?;
+            cs.enforce(
+                || "eq",
+                |lc| lc,
+                |lc| lc,
+                |lc| lc + ak.get_variable() - bk.get_variable(),
+            );
+            Ok(())
+        }
+
+        fn num_aux_blocks(&self) -> usize {
+            1
+        }
+    }
+    let m = Coin1 {
+        a: vec![Some(Fr::from(5)), Some(Fr::from(6))],
+        b: vec![Some(Fr::from(10)), Some(Fr::from(3))],
+    };
+    let g1 = Fr::one();
+    let g2 = Fr::one();
+    let alpha = Fr::from(48577);
+    let beta = Fr::from(22580);
+    let gamma = Fr::from(53332);
+    let delta = Fr::from(5481);
+    let delta2 = Fr::from(5482);
+    let tau = Fr::from(3673);
+    let pk = generate_parameters::<DummyEngine, _>(
+        &m,
+        g1,
+        g2,
+        alpha,
+        beta,
+        gamma,
+        vec![delta, delta2],
+        tau,
+    )
+    .unwrap();
+    let r = Fr::from(27134);
+    let s = Fr::from(17146);
+    let k = vec![Fr::from(1)];
+    let pf = create_proof(&m, &pk, r, s, k).unwrap();
+    let pvk = prepare_verifying_key(&pk.vk);
+    verify_proof(&pvk, &pf, &[]).unwrap();
+}
+
+#[test]
+fn test_3blocks_2coins() {
+    struct Test<F> {
+        a: Option<F>,
+        b: Option<F>,
+        c: Option<F>,
+        d: Option<F>,
+        e: Option<F>,
+    }
+
+    impl<F: ff::PrimeField> CcCircuit<F> for &Test<F> {
+        fn synthesize<CS: CcConstraintSystem<F>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+            use crate::gadgets::num::AllocatedNum;
+            use crate::gadgets::Assignment;
+            let a = AllocatedNum::alloc(cs.namespace(|| "a"), || self.a.get().map(Clone::clone))?;
+            a.inputize(cs.namespace(|| "input a"))?;
+            let b = AllocatedNum::alloc(cs.namespace(|| "b"), || self.b.get().map(Clone::clone))?;
+            cs.end_aux_block(|| "ab")?;
+            let c = AllocatedNum::alloc(cs.namespace(|| "c"), || self.c.get().map(Clone::clone))?;
+            cs.end_aux_block(|| "c")?;
+            let (j, val_j) = cs.alloc_random(|| "j")?;
+            let j = AllocatedNum {
+                variable: j,
+                value: val_j,
+            };
+            let d = AllocatedNum::alloc(cs.namespace(|| "d"), || self.d.get().map(Clone::clone))?;
+            let e = AllocatedNum::alloc(cs.namespace(|| "e"), || self.e.get().map(Clone::clone))?;
+            cs.end_aux_block(|| "de")?;
+            let (k, val_k) = cs.alloc_random(|| "k")?;
+            let k = AllocatedNum {
+                variable: k,
+                value: val_k,
+            };
+            let product = a
+                .mul(cs.namespace(|| "*b"), &b)?
+                .mul(cs.namespace(|| "*c"), &c)?
+                .mul(cs.namespace(|| "*d"), &d)?
+                .mul(cs.namespace(|| "*e"), &e)?
+                .mul(cs.namespace(|| "*j"), &j)?
+                .mul(cs.namespace(|| "*k"), &k)?;
+            let jk = j.mul(cs.namespace(|| "*jk"), &k)?;
+            cs.enforce(
+                || "eq",
+                |lc| lc,
+                |lc| lc,
+                |lc| lc + product.get_variable() - jk.get_variable(),
+            );
+            Ok(())
+        }
+
+        fn num_aux_blocks(&self) -> usize {
+            3
+        }
+    }
+    let m = Test {
+        a: Some(Fr::from(1)),
+        b: Some(Fr::from(1)),
+        c: Some(Fr::from(1)),
+        d: Some(Fr::from(1)),
+        e: Some(Fr::from(1)),
+    };
+    let g1 = Fr::one();
+    let g2 = Fr::one();
+    let alpha = Fr::from(48577);
+    let beta = Fr::from(22580);
+    let gamma = Fr::from(53332);
+    let delta = Fr::from(5481);
+    let delta2 = Fr::from(5482);
+    let delta3 = Fr::from(5483);
+    let delta4 = Fr::from(5483);
+    let tau = Fr::from(3673);
+    let pk = generate_parameters::<DummyEngine, _>(
+        &m,
+        g1,
+        g2,
+        alpha,
+        beta,
+        gamma,
+        vec![delta, delta2, delta3, delta4],
+        tau,
+    )
+    .unwrap();
+    let r = Fr::from(27134);
+    let s = Fr::from(17146);
+    let k = vec![Fr::from(1), Fr::from(15), Fr::from(5)];
+    let pf = create_proof(&m, &pk, r, s, k).unwrap();
+    let pvk = prepare_verifying_key(&pk.vk);
+    verify_proof(&pvk, &pf, &[Fr::from(1)]).unwrap();
 }
