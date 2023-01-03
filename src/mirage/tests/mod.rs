@@ -1,7 +1,7 @@
 use ff::{Field, PrimeField};
 
 mod dummy_engine;
-use self::dummy_engine::*;
+pub use self::dummy_engine::*;
 
 use std::marker::PhantomData;
 use std::ops::{AddAssign, MulAssign, SubAssign};

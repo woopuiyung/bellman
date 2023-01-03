@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
 
 mod generator;
 mod prover;
