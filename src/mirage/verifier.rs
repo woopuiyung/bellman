@@ -1,22 +1,23 @@
-use group::{prime::PrimeCurveAffine, Curve};
+use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
+use ff::{Field, PrimeField};
 use pairing::{MillerLoopResult, MultiMillerLoop};
 use std::ops::{AddAssign, Neg};
+use merlin::Transcript;
 
-use super::{PreparedVerifyingKey, Proof, VerifyingKey};
+use super::{PreparedVerifyingKey, Proof, VerifyingKey, merlin_rng};
 
 use crate::VerificationError;
 
-pub mod batch;
-
 pub fn prepare_verifying_key<E: MultiMillerLoop>(vk: &VerifyingKey<E>) -> PreparedVerifyingKey<E> {
     let gamma = vk.gamma_g2.neg();
-    let delta = vk.delta_g2.neg();
+    let neg_deltas_g2: Vec<E::G2Prepared> = vk.deltas_g2.iter().map(|d| d.neg().into()).collect();
 
     PreparedVerifyingKey {
         alpha_g1_beta_g2: E::pairing(&vk.alpha_g1, &vk.beta_g2),
         neg_gamma_g2: gamma.into(),
-        neg_delta_g2: delta.into(),
+        neg_deltas_g2,
         ic: vk.ic.clone(),
+        transcript: vk.transcript.clone(),
     }
 }
 
@@ -25,14 +26,39 @@ pub fn verify_proof<'a, E: MultiMillerLoop>(
     proof: &Proof<E>,
     public_inputs: &[E::Fr],
 ) -> Result<(), VerificationError> {
-    if (public_inputs.len() + 1) != pvk.ic.len() {
-        return Err(VerificationError::InvalidVerifyingKey);
-    }
-
+    let mut transcript = Transcript::new(b"mirage_aozdemir_1");
     let mut acc = pvk.ic[0].to_curve();
+    transcript.append_message(b"input", E::Fr::from(1).to_repr().as_ref());
 
-    for (i, b) in public_inputs.iter().zip(pvk.ic.iter().skip(1)) {
-        AddAssign::<&E::G1>::add_assign(&mut acc, &(*b * i));
+    let mut public_inputs_i = 0;
+    let mut aux_commits_i = 0;
+    let mut i = 1;
+    for t in &pvk.transcript {
+        match t {
+            crate::mirage::TranscriptEntry::Coin => {
+                let mut rng = merlin_rng(&mut transcript, b"random");
+                let coin = E::Fr::random(&mut *rng);
+                transcript.append_message(b"input", coin.to_repr().as_ref());
+                AddAssign::<&E::G1>::add_assign(&mut acc, &(pvk.ic[i] * coin));
+                i += 1;
+            }
+            crate::mirage::TranscriptEntry::PublicInput => {
+                AddAssign::<&E::G1>::add_assign(
+                    &mut acc,
+                    &(pvk.ic[i] * public_inputs[public_inputs_i]),
+                );
+                transcript.append_message(b"input", public_inputs[public_inputs_i].to_repr().as_ref());
+                public_inputs_i += 1;
+                i += 1;
+            }
+            crate::mirage::TranscriptEntry::AuxCommit => {
+                transcript.append_message(b"aux_commit", proof.ds[aux_commits_i].to_uncompressed().as_ref());
+                aux_commits_i += 1;
+            }
+        }
+    }
+    if i != pvk.ic.len() || aux_commits_i != proof.ds.len() {
+        return Err(VerificationError::InvalidVerifyingKey);
     }
 
     // The original verification equation is:
@@ -43,14 +69,19 @@ pub fn verify_proof<'a, E: MultiMillerLoop>(
     // A * B + inputs * (-gamma) + C * (-delta) = alpha * beta
     // which allows us to do a single final exponentiation.
 
-    if pvk.alpha_g1_beta_g2
-        == E::multi_miller_loop(&[
-            (&proof.a, &proof.b.into()),
-            (&acc.to_affine(), &pvk.neg_gamma_g2),
-            (&proof.c, &pvk.neg_delta_g2),
-        ])
-        .final_exponentiation()
-    {
+    let b = proof.b.into();
+    let acc = acc.to_affine();
+    let last = pvk.neg_deltas_g2.len() - 1;
+    let mut multi_miller_input = vec![
+        (&proof.a, &b),
+        (&acc, &pvk.neg_gamma_g2),
+        (&proof.c, &pvk.neg_deltas_g2[last]),
+    ];
+    assert_eq!(pvk.neg_deltas_g2.len(), proof.ds.len() + 1);
+    for (i, d) in proof.ds.iter().enumerate() {
+        multi_miller_input.push((d, &pvk.neg_deltas_g2[i]));
+    }
+    if pvk.alpha_g1_beta_g2 == E::multi_miller_loop(&multi_miller_input).final_exponentiation() {
         Ok(())
     } else {
         Err(VerificationError::InvalidProof)

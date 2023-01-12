@@ -143,8 +143,12 @@ pub mod gadgets;
 pub mod groth16;
 #[cfg(feature = "mirage")]
 pub mod mirage;
+#[cfg(feature = "mirage")]
+pub mod kw15;
 pub mod multicore;
 pub mod multiexp;
+mod curve_io;
+pub mod cc;
 
 use ff::PrimeField;
 

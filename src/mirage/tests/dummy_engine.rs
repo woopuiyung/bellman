@@ -428,7 +428,7 @@ impl AsMut<[u8]> for FakePoint {
 
 impl AsRef<[u8]> for FakePoint {
     fn as_ref(&self) -> &[u8] {
-        unimplemented!()
+        &[]
     }
 }
 
@@ -481,7 +481,7 @@ impl UncompressedEncoding for Fr {
     }
 
     fn to_uncompressed(&self) -> Self::Uncompressed {
-        unimplemented!()
+        FakePoint
     }
 }
 

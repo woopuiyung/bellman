@@ -1,9 +1,17 @@
-//! The [Groth16] proving system.
+//! The [Mirage] proving system.
 //!
-//! [Groth16]: https://eprint.iacr.org/2016/260
+//! [Mirage]: https://eprint.iacr.org/2020/278
+//!
+//! Based on Bellman's original implementation of Groth16.
+//!
+//! Notation:
+//! * new proof elements: pi_d(s)
 
 use group::{prime::PrimeCurveAffine, GroupEncoding, UncompressedEncoding};
 use pairing::{Engine, MultiMillerLoop};
+use merlin::Transcript;
+use rand_core::{SeedableRng, RngCore};
+use rand_chacha::ChaChaRng;
 
 use crate::SynthesisError;
 
@@ -13,7 +21,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
 
 mod generator;
 mod prover;
@@ -23,16 +31,24 @@ pub use self::generator::*;
 pub use self::prover::*;
 pub use self::verifier::*;
 
+/// Get a crypto RNG from a [merlin] transcript.
+fn merlin_rng(t: &mut Transcript, label: &'static [u8]) -> Box<dyn RngCore> {
+    let mut seed = [0u8; 32];
+    t.challenge_bytes(label, &mut seed[..]);
+    Box::new(ChaChaRng::from_seed(seed))
+}
+
 #[derive(Clone, Debug)]
 pub struct Proof<E: Engine> {
     pub a: E::G1Affine,
     pub b: E::G2Affine,
     pub c: E::G1Affine,
+    pub ds: Vec<E::G1Affine>,
 }
 
 impl<E: Engine> PartialEq for Proof<E> {
     fn eq(&self, other: &Self) -> bool {
-        self.a == other.a && self.b == other.b && self.c == other.c
+        self.a == other.a && self.b == other.b && self.c == other.c && self.ds == other.ds
     }
 }
 
@@ -41,7 +57,10 @@ impl<E: Engine> Proof<E> {
         writer.write_all(self.a.to_bytes().as_ref())?;
         writer.write_all(self.b.to_bytes().as_ref())?;
         writer.write_all(self.c.to_bytes().as_ref())?;
-
+        writer.write_u32::<BigEndian>(self.ds.len() as u32)?;
+        for d in &self.ds {
+            writer.write_all(d.to_bytes().as_ref())?;
+        }
         Ok(())
     }
 
@@ -95,9 +114,21 @@ impl<E: Engine> Proof<E> {
         let a = read_g1(&mut reader)?;
         let b = read_g2(&mut reader)?;
         let c = read_g1(&mut reader)?;
+        let ds_len = reader.read_u32::<BigEndian>()? as usize;
+        let mut ds = vec![];
+        for _ in 0..ds_len {
+            ds.push(read_g1(&mut reader)?);
+        }
 
-        Ok(Proof { a, b, c })
+        Ok(Proof { a, b, c, ds })
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TranscriptEntry {
+    Coin,
+    PublicInput,
+    AuxCommit,
 }
 
 #[derive(Clone)]
@@ -114,18 +145,23 @@ pub struct VerifyingKey<E: Engine> {
     // gamma in g2 for verifying. Never the point at infinity.
     pub gamma_g2: E::G2Affine,
 
-    // delta in g1/g2 for verifying and proving, essentially the magic
+    // deltas in g1/g2 for verifying and proving, essentially the magic
     // trapdoor that forces the prover to evaluate the C element of the
     // proof with only components from the CRS. Never the point at
     // infinity.
-    pub delta_g1: E::G1Affine,
-    pub delta_g2: E::G2Affine,
+    //
+    // The last delta is Groth's. The rest are from Mirage.
+    pub deltas_g1: Vec<E::G1Affine>,
+    pub deltas_g2: Vec<E::G2Affine>,
 
     // Elements of the form (beta * u_i(tau) + alpha v_i(tau) + w_i(tau)) / gamma
     // for all public inputs. Because all public inputs have a dummy constraint,
     // this is the same size as the number of inputs, and never contains points
     // at infinity.
     pub ic: Vec<E::G1Affine>,
+
+    // Transcript
+    pub transcript: Vec<TranscriptEntry>,
 }
 
 impl<E: Engine> PartialEq for VerifyingKey<E> {
@@ -134,9 +170,10 @@ impl<E: Engine> PartialEq for VerifyingKey<E> {
             && self.beta_g1 == other.beta_g1
             && self.beta_g2 == other.beta_g2
             && self.gamma_g2 == other.gamma_g2
-            && self.delta_g1 == other.delta_g1
-            && self.delta_g2 == other.delta_g2
+            && self.deltas_g1 == other.deltas_g1
+            && self.deltas_g2 == other.deltas_g2
             && self.ic == other.ic
+            && self.transcript == other.transcript
     }
 }
 
@@ -146,11 +183,24 @@ impl<E: Engine> VerifyingKey<E> {
         writer.write_all(self.beta_g1.to_uncompressed().as_ref())?;
         writer.write_all(self.beta_g2.to_uncompressed().as_ref())?;
         writer.write_all(self.gamma_g2.to_uncompressed().as_ref())?;
-        writer.write_all(self.delta_g1.to_uncompressed().as_ref())?;
-        writer.write_all(self.delta_g2.to_uncompressed().as_ref())?;
+        writer.write_u32::<BigEndian>(self.deltas_g1.len() as u32)?;
+        for d in &self.deltas_g1 {
+            writer.write_all(d.to_uncompressed().as_ref())?;
+        }
+        for d in &self.deltas_g2 {
+            writer.write_all(d.to_uncompressed().as_ref())?;
+        }
         writer.write_u32::<BigEndian>(self.ic.len() as u32)?;
         for ic in &self.ic {
             writer.write_all(ic.to_uncompressed().as_ref())?;
+        }
+        writer.write_u32::<BigEndian>(self.transcript.len() as u32)?;
+        for e in &self.transcript {
+            match e {
+                TranscriptEntry::Coin => writer.write_u8(0),
+                TranscriptEntry::PublicInput => writer.write_u8(1),
+                TranscriptEntry::AuxCommit => writer.write_u8(2),
+            }?;
         }
 
         Ok(())
@@ -185,8 +235,15 @@ impl<E: Engine> VerifyingKey<E> {
         let beta_g1 = read_g1(&mut reader)?;
         let beta_g2 = read_g2(&mut reader)?;
         let gamma_g2 = read_g2(&mut reader)?;
-        let delta_g1 = read_g1(&mut reader)?;
-        let delta_g2 = read_g2(&mut reader)?;
+        let deltas_len = reader.read_u32::<BigEndian>()? as usize;
+        let mut deltas_g1 = vec![];
+        for _ in 0..deltas_len {
+            deltas_g1.push(read_g1(&mut reader)?);
+        }
+        let mut deltas_g2 = vec![];
+        for _ in 0..deltas_len {
+            deltas_g2.push(read_g2(&mut reader)?);
+        }
 
         let ic_len = reader.read_u32::<BigEndian>()? as usize;
 
@@ -206,15 +263,31 @@ impl<E: Engine> VerifyingKey<E> {
 
             ic.push(g1);
         }
+        let transcript_len = reader.read_u32::<BigEndian>()? as usize;
+        let mut transcript = vec![];
+        for _ in 0..transcript_len {
+            transcript.push(match reader.read_u8()? {
+                0 => TranscriptEntry::Coin,
+                1 => TranscriptEntry::PublicInput,
+                2 => TranscriptEntry::AuxCommit,
+                i => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("u8 {} is not a valid transcript entry", i),
+                    ))
+                }
+            });
+        }
 
         Ok(VerifyingKey {
             alpha_g1,
             beta_g1,
             beta_g2,
             gamma_g2,
-            delta_g1,
-            delta_g2,
+            deltas_g1,
+            deltas_g2,
             ic,
+            transcript,
         })
     }
 }
@@ -230,7 +303,10 @@ pub struct Parameters<E: Engine> {
     // Elements of the form (beta * u_i(tau) + alpha v_i(tau) + w_i(tau)) / delta
     // for all auxiliary inputs. Variables can never be unconstrained, so this
     // never contains points at infinity.
-    pub l: Arc<Vec<E::G1Affine>>,
+    //
+    // The last is for I (in Mirage)
+    // The rest are for Js
+    pub ls: Vec<Arc<Vec<E::G1Affine>>>,
 
     // QAP "A" polynomials evaluated at tau in the Lagrange basis. Never contains
     // points at infinity: polynomials that evaluate to zero are omitted from
@@ -248,7 +324,7 @@ impl<E: Engine> PartialEq for Parameters<E> {
     fn eq(&self, other: &Self) -> bool {
         self.vk == other.vk
             && self.h == other.h
-            && self.l == other.l
+            && self.ls == other.ls
             && self.a == other.a
             && self.b_g1 == other.b_g1
             && self.b_g2 == other.b_g2
@@ -264,9 +340,12 @@ impl<E: Engine> Parameters<E> {
             writer.write_all(g.to_uncompressed().as_ref())?;
         }
 
-        writer.write_u32::<BigEndian>(self.l.len() as u32)?;
-        for g in &self.l[..] {
-            writer.write_all(g.to_uncompressed().as_ref())?;
+        writer.write_u32::<BigEndian>(self.ls.len() as u32)?;
+        for l in &self.ls {
+            writer.write_u32::<BigEndian>(l.len() as u32)?;
+            for g in &l[..] {
+                writer.write_all(g.to_uncompressed().as_ref())?;
+            }
         }
 
         writer.write_u32::<BigEndian>(self.a.len() as u32)?;
@@ -347,7 +426,7 @@ impl<E: Engine> Parameters<E> {
         let vk = VerifyingKey::<E>::read(&mut reader)?;
 
         let mut h = vec![];
-        let mut l = vec![];
+        let mut ls = vec![];
         let mut a = vec![];
         let mut b_g1 = vec![];
         let mut b_g2 = vec![];
@@ -360,9 +439,14 @@ impl<E: Engine> Parameters<E> {
         }
 
         {
-            let len = reader.read_u32::<BigEndian>()? as usize;
-            for _ in 0..len {
-                l.push(read_g1(&mut reader)?);
+            let ls_len = reader.read_u32::<BigEndian>()? as usize;
+            for _ in 0..ls_len {
+                let mut l = vec![];
+                let l_len = reader.read_u32::<BigEndian>()? as usize;
+                for _ in 0..l_len {
+                    l.push(read_g1(&mut reader)?);
+                }
+                ls.push(Arc::new(l));
             }
         }
 
@@ -390,7 +474,7 @@ impl<E: Engine> Parameters<E> {
         Ok(Parameters {
             vk,
             h: Arc::new(h),
-            l: Arc::new(l),
+            ls,
             a: Arc::new(a),
             b_g1: Arc::new(b_g1),
             b_g2: Arc::new(b_g2),
@@ -403,10 +487,12 @@ pub struct PreparedVerifyingKey<E: MultiMillerLoop> {
     alpha_g1_beta_g2: E::Gt,
     /// -gamma in G2
     neg_gamma_g2: E::G2Prepared,
-    /// -delta in G2
-    neg_delta_g2: E::G2Prepared,
+    /// -deltas in G2
+    neg_deltas_g2: Vec<E::G2Prepared>,
     /// Copy of IC from `VerifiyingKey`.
     ic: Vec<E::G1Affine>,
+    /// Transcript
+    pub transcript: Vec<TranscriptEntry>,
 }
 
 pub trait ParameterSource<E: Engine> {
@@ -415,7 +501,7 @@ pub trait ParameterSource<E: Engine> {
 
     fn get_vk(&mut self, num_ic: usize) -> Result<VerifyingKey<E>, SynthesisError>;
     fn get_h(&mut self, num_h: usize) -> Result<Self::G1Builder, SynthesisError>;
-    fn get_l(&mut self, num_l: usize) -> Result<Self::G1Builder, SynthesisError>;
+    fn get_l(&mut self, num_l: usize, l_idx: usize) -> Result<Self::G1Builder, SynthesisError>;
     fn get_a(
         &mut self,
         num_inputs: usize,
@@ -445,8 +531,8 @@ impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
         Ok((self.h.clone(), 0))
     }
 
-    fn get_l(&mut self, _: usize) -> Result<Self::G1Builder, SynthesisError> {
-        Ok((self.l.clone(), 0))
+    fn get_l(&mut self, _: usize, l_idx: usize) -> Result<Self::G1Builder, SynthesisError> {
+        Ok((self.ls[l_idx].clone(), 0))
     }
 
     fn get_a(
@@ -477,7 +563,10 @@ impl<'a, E: Engine> ParameterSource<E> for &'a Parameters<E> {
 #[cfg(test)]
 mod test_with_bls12_381 {
     use super::*;
-    use crate::{Circuit, ConstraintSystem, SynthesisError};
+    use crate::{
+        cc::{CcCircuit, CcConstraintSystem},
+        SynthesisError,
+    };
 
     use bls12_381::{Bls12, Scalar};
     use ff::{Field, PrimeField};
@@ -491,8 +580,8 @@ mod test_with_bls12_381 {
             b: Option<Scalar>,
         }
 
-        impl<Scalar: PrimeField> Circuit<Scalar> for MySillyCircuit<Scalar> {
-            fn synthesize<CS: ConstraintSystem<Scalar>>(
+        impl<Scalar: PrimeField> CcCircuit<Scalar> for MySillyCircuit<Scalar> {
+            fn synthesize<CS: CcConstraintSystem<Scalar>>(
                 self,
                 cs: &mut CS,
             ) -> Result<(), SynthesisError> {
@@ -513,6 +602,10 @@ mod test_with_bls12_381 {
 
                 Ok(())
             }
+
+            fn num_aux_blocks(&self) -> usize {
+                0
+            }
         }
 
         let mut rng = thread_rng();
@@ -527,7 +620,7 @@ mod test_with_bls12_381 {
             let mut v = vec![];
 
             params.write(&mut v).unwrap();
-            assert_eq!(v.len(), 2136);
+            assert_eq!(v.len(), 2148);
 
             let de_params = Parameters::read(&v[..], true).unwrap();
             assert!(params == de_params);
@@ -557,7 +650,7 @@ mod test_with_bls12_381 {
             let mut v = vec![];
             proof.write(&mut v).unwrap();
 
-            assert_eq!(v.len(), 192);
+            assert_eq!(v.len(), 196);
 
             let de_proof = Proof::read(&v[..]).unwrap();
             assert!(proof == de_proof);
