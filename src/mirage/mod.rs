@@ -8,11 +8,12 @@
 //! * new proof elements: pi_d(s)
 
 use group::{prime::PrimeCurveAffine, GroupEncoding, UncompressedEncoding};
-use pairing::{Engine, MultiMillerLoop};
 use merlin::Transcript;
-use rand_core::{SeedableRng, RngCore};
+use pairing::{Engine, MultiMillerLoop};
 use rand_chacha::ChaChaRng;
+use rand_core::{RngCore, SeedableRng};
 
+use crate::commit::CommitKey;
 use crate::SynthesisError;
 
 use crate::multiexp::SourceBuilder;
@@ -320,6 +321,15 @@ pub struct Parameters<E: Engine> {
     pub b_g2: Arc<Vec<E::G2Affine>>,
 }
 
+impl<E: Engine> Parameters<E>
+{
+    /// Get the commitment key for the ith aux block.
+    pub fn get_commitment_key(&self, i: usize) -> CommitKey<E> {
+        assert!(i < self.ls.len() - 1);
+        CommitKey::new(self.ls[i].clone(), self.vk.deltas_g1.last().unwrap().clone())
+    }
+}
+
 impl<E: Engine> PartialEq for Parameters<E> {
     fn eq(&self, other: &Self) -> bool {
         self.vk == other.vk
@@ -620,7 +630,7 @@ mod test_with_bls12_381 {
             let mut v = vec![];
 
             params.write(&mut v).unwrap();
-            assert_eq!(v.len(), 2148);
+            assert_eq!(v.len(), 2149);
 
             let de_params = Parameters::read(&v[..], true).unwrap();
             assert!(params == de_params);

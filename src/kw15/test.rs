@@ -6,7 +6,7 @@ use rand_chacha::ChaChaRng;
 use crate::mirage::tests::DummyEngine;
 use bls12_381::Bls12;
 
-fn test_rng() -> Box<dyn RngCore> {
+pub fn test_rng() -> Box<dyn RngCore> {
     Box::new(ChaChaRng::from_seed([0u8; 32]))
 }
 
@@ -15,7 +15,7 @@ fn random_statement<E: Engine, R: RngCore>(num_cmts: usize, num_wits: usize, rng
     let mut matrix = Matrix::<E>::new(num_cmts, num_wits);
     for i in 0..num_cmts {
         for j in 0..num_wits {
-            matrix.add_entry(i, j, E::G1::random(&mut *rng));
+            matrix.add_entry(i, j, E::G1::random(&mut *rng).into());
         }
     }
     let wits: Vec<E::Fr> = (0..num_wits).map(|_| E::Fr::random(&mut *rng)).collect();

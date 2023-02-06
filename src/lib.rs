@@ -145,6 +145,8 @@ pub mod groth16;
 pub mod mirage;
 #[cfg(feature = "mirage")]
 pub mod kw15;
+#[cfg(feature = "mirage")]
+pub mod commit;
 pub mod multicore;
 pub mod multiexp;
 mod curve_io;

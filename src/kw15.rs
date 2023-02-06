@@ -32,7 +32,7 @@ pub struct Matrix<E: Engine> {
     /// The number of witnesses (t)
     num_wits: usize,
     /// The entries of the matrix: (cmt_i, wit_i, value)
-    nonzero_entries: Vec<(usize, usize, E::G1)>,
+    nonzero_entries: Vec<(usize, usize, E::G1Affine)>,
 }
 
 impl<E: Engine> Matrix<E> {
@@ -45,7 +45,7 @@ impl<E: Engine> Matrix<E> {
         }
     }
     /// Add `value` to the entry for commitment `cmt_i` and witness `wit_i`.
-    pub fn add_entry(&mut self, cmt_i: usize, wit_i: usize, value: E::G1) {
+    pub fn add_entry(&mut self, cmt_i: usize, wit_i: usize, value: E::G1Affine) {
         assert!(cmt_i < self.num_cmts);
         assert!(wit_i < self.num_wits);
         self.nonzero_entries.push((cmt_i, wit_i, value));
@@ -210,4 +210,4 @@ where
 }
 
 #[cfg(test)]
-mod test;
+pub mod test;
