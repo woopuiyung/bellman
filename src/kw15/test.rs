@@ -40,6 +40,11 @@ where
 }
 
 #[test]
+fn dummy_empty() {
+    random_test::<DummyEngine>(0, 0);
+}
+
+#[test]
 fn dummy_one_by_one() {
     random_test::<DummyEngine>(1, 1);
 }
