@@ -129,7 +129,11 @@ where
     let a: E::Fr = E::Fr::random(&mut rng);
 
     // Compute [P]_1 in parallel
-    let p_g1: Arc<Vec<Mutex<E::G1>>> = Arc::new((0..m.num_wits).map(|_| Mutex::new(E::G1::identity())).collect());
+    let p_g1: Arc<Vec<Mutex<E::G1>>> = Arc::new(
+        (0..m.num_wits)
+            .map(|_| Mutex::new(E::G1::identity()))
+            .collect(),
+    );
     let worker = Worker::new();
     let nonzero_entries = Arc::new(m.nonzero_entries.clone());
     let k_arc = Arc::new(k.clone());
@@ -199,6 +203,9 @@ pub fn verify<E>(vk: &PreparedVerifyingKey<E>, cmts: &[E::G1Affine], pf: &Proof<
 where
     E: MultiMillerLoop,
 {
+    if cmts.is_empty() {
+        return true;
+    }
     assert_eq!(cmts.len(), vk.c_g2.len());
     let mut multi_miller_inputs: Vec<(&E::G1Affine, &E::G2Prepared)> = Vec::new();
     for (cmt, c) in cmts.iter().zip(&vk.c_g2) {
@@ -207,6 +214,21 @@ where
     multi_miller_inputs.push((&pf.pi_g1, &vk.neg_a_g2));
     let res = E::multi_miller_loop(multi_miller_inputs.as_slice()).final_exponentiation();
     bool::from(res.is_identity())
+}
+
+pub fn commit<E>(ck: Arc<Vec<E::G1Affine>>, data: &[E::Fr]) -> E::G1
+where
+    E: Engine,
+    E::Fr: PrimeFieldBits,
+{
+    assert_eq!(ck.len(), data.len());
+    let worker = Worker::new();
+    let bases: Arc<Vec<E::G1Affine>> = ck;
+    let coeffs: Arc<Vec<Exponent<E::Fr>>> =
+        Arc::new(data.iter().map(|w| Exponent::from(w)).collect());
+    multiexp(&worker, (bases, 0), FullDensity, coeffs)
+        .wait()
+        .unwrap()
 }
 
 #[cfg(test)]

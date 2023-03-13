@@ -227,8 +227,11 @@ where
     assembly.alloc_input(|| "", || Ok(E::Fr::one()))?;
     assembly.transcript.pop();
 
+    let claimed_num_aux_blocks = circuit.num_aux_blocks();
     // Synthesize the circuit.
     circuit.synthesize(&mut assembly)?;
+    assert_eq!(claimed_num_aux_blocks, assembly.aux_block_indices.len());
+
 
     // Input constraints to ensure full density of IC query
     // x * 0 = 0

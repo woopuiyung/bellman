@@ -7,7 +7,7 @@ use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
 use merlin::Transcript;
 use pairing::Engine;
 
-use super::{VerifyingKey, ParameterSource, Proof, merlin_rng};
+use super::{merlin_rng, ParameterSource, Proof, VerifyingKey};
 
 use crate::{
     cc::{CcCircuit, CcConstraintSystem},
@@ -76,6 +76,8 @@ struct ProvingAssignment<'p, E: Engine, P: ParameterSource<E> + 'p> {
     // proof randomness
     kappa_3s: Vec<E::Fr>,
     pi_ds: Vec<E::G1Affine>,
+    /// The scalars underlying the pi_ds.
+    aux_blocks: Vec<Vec<E::Fr>>,
     vk: &'p VerifyingKey<E>,
     params: &'p mut P,
 
@@ -110,7 +112,10 @@ impl<'p, E: Engine, P: ParameterSource<E> + 'p> ConstraintSystem<E::Fr>
         AR: Into<String>,
     {
         self.input_assignment.push(f()?);
-        self.transcript.append_message(b"input", self.input_assignment.last().unwrap().to_repr().as_ref());
+        self.transcript.append_message(
+            b"input",
+            self.input_assignment.last().unwrap().to_repr().as_ref(),
+        );
         self.b_input_density.add_element();
 
         Ok(Variable(Index::Input(self.input_assignment.len() - 1)))
@@ -204,6 +209,8 @@ where
         let start = self.aux_block_indices.last().copied().unwrap_or(0);
         let end = self.aux_assignment.len();
         assert!(end > start);
+        self.aux_blocks
+            .push(self.aux_assignment[start..end].to_vec());
         let aux_assignment = Arc::new(
             self.aux_assignment[start..end]
                 .into_iter()
@@ -212,15 +219,19 @@ where
         );
         let mut pi_d: E::G1 = multiexp(
             &worker,
-            self.params
-                .get_l(end - start, i)?,
+            self.params.get_l(end - start, i)?,
             FullDensity,
             aux_assignment,
-        ).wait()?;
+        )
+        .wait()?;
         // [ J_i(s)/delta_i + delta_last * k_i ]_1
-        AddAssign::<&E::G1>::add_assign(&mut pi_d, &(self.vk.deltas_g1.last().unwrap().clone() * self.kappa_3s[i]));
+        AddAssign::<&E::G1>::add_assign(
+            &mut pi_d,
+            &(self.vk.deltas_g1.last().unwrap().clone() * self.kappa_3s[i]),
+        );
         let pi_d = pi_d.to_affine();
-        self.transcript.append_message(b"aux_commit", pi_d.to_uncompressed().as_ref());
+        self.transcript
+            .append_message(b"aux_commit", pi_d.to_uncompressed().as_ref());
         self.pi_ds.push(pi_d);
         self.aux_block_indices.push(self.aux_assignment.len());
         Ok(())
@@ -231,7 +242,7 @@ pub fn create_random_proof<E, C, R, P: ParameterSource<E>>(
     circuit: C,
     params: P,
     mut rng: &mut R,
-) -> Result<Proof<E>, SynthesisError>
+) -> Result<(Proof<E>, Vec<Vec<E::Fr>>), SynthesisError>
 where
     E: Engine,
     E::Fr: PrimeFieldBits,
@@ -253,7 +264,7 @@ pub fn create_proof<E, C, P: ParameterSource<E>>(
     r: E::Fr,
     s: E::Fr,
     kappa_3s: Vec<E::Fr>,
-) -> Result<Proof<E>, SynthesisError>
+) -> Result<(Proof<E>, Vec<Vec<E::Fr>>), SynthesisError>
 where
     E: Engine,
     E::Fr: PrimeFieldBits,
@@ -275,6 +286,7 @@ where
         params: &mut params,
         vk: &vk,
         pi_ds: vec![],
+        aux_blocks: vec![],
         input_assignment: vec![],
         aux_assignment: vec![],
         aux_block_indices: vec![],
@@ -327,8 +339,7 @@ where
     );
     let final_block_aux_assignment = Arc::new({
         let start = prover.aux_block_indices.last().cloned().unwrap_or(0);
-        prover
-            .aux_assignment[start..]
+        prover.aux_assignment[start..]
             .iter()
             .cloned()
             .into_iter()
@@ -345,15 +356,19 @@ where
 
     let l = multiexp(
         &worker,
-        prover.params.get_l(final_block_aux_assignment.len(), prover.aux_block_indices.len())?,
+        prover.params.get_l(
+            final_block_aux_assignment.len(),
+            prover.aux_block_indices.len(),
+        )?,
         FullDensity,
         final_block_aux_assignment.clone(),
     );
 
     let a_aux_density_total = prover.a_aux_density.get_total_density();
 
-    let (a_inputs_source, a_aux_source) =
-        prover.params.get_a(input_assignment.len(), a_aux_density_total)?;
+    let (a_inputs_source, a_aux_source) = prover
+        .params
+        .get_a(input_assignment.len(), a_aux_density_total)?;
 
     let a_inputs = multiexp(
         &worker,
@@ -373,8 +388,9 @@ where
     let b_aux_density = Arc::new(prover.b_aux_density);
     let b_aux_density_total = b_aux_density.get_total_density();
 
-    let (b_g1_inputs_source, b_g1_aux_source) =
-        prover.params.get_b_g1(b_input_density_total, b_aux_density_total)?;
+    let (b_g1_inputs_source, b_g1_aux_source) = prover
+        .params
+        .get_b_g1(b_input_density_total, b_aux_density_total)?;
 
     let b_g1_inputs = multiexp(
         &worker,
@@ -389,8 +405,9 @@ where
         aux_assignment.clone(),
     );
 
-    let (b_g2_inputs_source, b_g2_aux_source) =
-        prover.params.get_b_g2(b_input_density_total, b_aux_density_total)?;
+    let (b_g2_inputs_source, b_g2_aux_source) = prover
+        .params
+        .get_b_g2(b_input_density_total, b_aux_density_total)?;
 
     let b_g2_inputs = multiexp(
         &worker,
@@ -442,10 +459,13 @@ where
     AddAssign::<&E::G1>::add_assign(&mut g_c, &h.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &l.wait()?);
 
-    Ok(Proof {
-        a: g_a.to_affine(),
-        b: g_b.to_affine(),
-        c: g_c.to_affine(),
-        ds: prover.pi_ds,
-    })
+    Ok((
+        Proof {
+            a: g_a.to_affine(),
+            b: g_b.to_affine(),
+            c: g_c.to_affine(),
+            ds: prover.pi_ds,
+        },
+        prover.aux_blocks,
+    ))
 }
