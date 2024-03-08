@@ -1,10 +1,10 @@
-use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
 use ff::{Field, PrimeField};
+use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
+use merlin::Transcript;
 use pairing::{MillerLoopResult, MultiMillerLoop};
 use std::ops::{AddAssign, Neg};
-use merlin::Transcript;
 
-use super::{PreparedVerifyingKey, Proof, VerifyingKey, merlin_rng};
+use super::{merlin_rng, PreparedVerifyingKey, Proof, VerifyingKey};
 
 use crate::VerificationError;
 
@@ -47,12 +47,16 @@ pub fn verify_proof<'a, E: MultiMillerLoop>(
                     &mut acc,
                     &(pvk.ic[i] * public_inputs[public_inputs_i]),
                 );
-                transcript.append_message(b"input", public_inputs[public_inputs_i].to_repr().as_ref());
+                transcript
+                    .append_message(b"input", public_inputs[public_inputs_i].to_repr().as_ref());
                 public_inputs_i += 1;
                 i += 1;
             }
             crate::mirage::TranscriptEntry::AuxCommit => {
-                transcript.append_message(b"aux_commit", proof.ds[aux_commits_i].to_uncompressed().as_ref());
+                transcript.append_message(
+                    b"aux_commit",
+                    proof.ds[aux_commits_i].to_uncompressed().as_ref(),
+                );
                 aux_commits_i += 1;
             }
         }

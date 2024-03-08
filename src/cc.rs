@@ -30,8 +30,7 @@ pub trait CcConstraintSystem<Scalar: PrimeField>: ConstraintSystem<Scalar> {
 /// For synthesizing a constraint system for a CC-zkSNARK.
 pub trait CcCircuit<Scalar: PrimeField> {
     /// Synthesize
-    fn synthesize<CS: CcConstraintSystem<Scalar>>(self, cs: &mut CS)
-        -> Result<(), SynthesisError>;
+    fn synthesize<CS: CcConstraintSystem<Scalar>>(self, cs: &mut CS) -> Result<(), SynthesisError>;
     /// How many auxilary blocks will this circuit produce?
     fn num_aux_blocks(&self) -> usize;
 }

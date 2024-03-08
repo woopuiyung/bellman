@@ -321,12 +321,14 @@ pub struct Parameters<E: Engine> {
     pub b_g2: Arc<Vec<E::G2Affine>>,
 }
 
-impl<E: Engine> Parameters<E>
-{
+impl<E: Engine> Parameters<E> {
     /// Get the commitment key for the ith aux block.
     pub fn get_commitment_key(&self, i: usize) -> CommitKey<E> {
         assert!(i < self.ls.len() - 1);
-        CommitKey::new(self.ls[i].clone(), self.vk.deltas_g1.last().unwrap().clone())
+        CommitKey::new(
+            self.ls[i].clone(),
+            self.vk.deltas_g1.last().unwrap().clone(),
+        )
     }
 }
 

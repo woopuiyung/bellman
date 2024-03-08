@@ -6,7 +6,7 @@ use ff::{Field, PrimeField};
 use group::{prime::PrimeCurveAffine, Curve, Group, Wnaf, WnafGroup};
 use pairing::Engine;
 
-use super::{Parameters, VerifyingKey, TranscriptEntry};
+use super::{Parameters, TranscriptEntry, VerifyingKey};
 
 use crate::cc::{CcCircuit, CcConstraintSystem};
 use crate::{ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
@@ -231,7 +231,6 @@ where
     // Synthesize the circuit.
     circuit.synthesize(&mut assembly)?;
     assert_eq!(claimed_num_aux_blocks, assembly.aux_block_indices.len());
-
 
     // Input constraints to ensure full density of IC query
     // x * 0 = 0

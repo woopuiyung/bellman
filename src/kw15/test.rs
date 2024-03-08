@@ -1,17 +1,20 @@
 use super::*;
 
-use group::Group;
-use rand_core::{RngCore, SeedableRng};
-use rand_chacha::ChaChaRng;
 use crate::mirage::tests::DummyEngine;
 use bls12_381::Bls12;
+use group::Group;
+use rand_chacha::ChaChaRng;
+use rand_core::{RngCore, SeedableRng};
 
 pub fn test_rng() -> Box<dyn RngCore> {
     Box::new(ChaChaRng::from_seed([0u8; 32]))
 }
 
-fn random_statement<E: Engine, R: RngCore>(num_cmts: usize, num_wits: usize, rng: &mut R) ->
-(Matrix<E>, Vec<E::G1Affine>, Vec<E::Fr>) {
+fn random_statement<E: Engine, R: RngCore>(
+    num_cmts: usize,
+    num_wits: usize,
+    rng: &mut R,
+) -> (Matrix<E>, Vec<E::G1Affine>, Vec<E::Fr>) {
     let mut matrix = Matrix::<E>::new(num_cmts, num_wits);
     for i in 0..num_cmts {
         for j in 0..num_wits {

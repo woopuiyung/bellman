@@ -138,15 +138,17 @@ where
     let nonzero_entries = Arc::new(m.nonzero_entries.clone());
     let k_arc = Arc::new(k.clone());
     worker.scope(nonzero_entries.len(), |scope, chunk| {
-        for nz in nonzero_entries.chunks(chunk) {
-            let p_g1 = p_g1.clone();
-            let k_arc = k_arc.clone();
-            scope.spawn(move |_scope| {
-                for (cmt_i, wit_i, val) in nz {
-                    let add = val.clone() * k_arc[*cmt_i];
-                    *p_g1[*wit_i].lock().unwrap() += add;
-                }
-            })
+        if chunk > 0 {
+            for nz in nonzero_entries.chunks(chunk) {
+                let p_g1 = p_g1.clone();
+                let k_arc = k_arc.clone();
+                scope.spawn(move |_scope| {
+                    for (cmt_i, wit_i, val) in nz {
+                        let add = val.clone() * k_arc[*cmt_i];
+                        *p_g1[*wit_i].lock().unwrap() += add;
+                    }
+                })
+            }
         }
     });
 
