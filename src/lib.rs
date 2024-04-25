@@ -151,6 +151,7 @@ pub mod kw15;
 pub mod mirage;
 pub mod multicore;
 pub mod multiexp;
+mod trace;
 
 use ff::PrimeField;
 

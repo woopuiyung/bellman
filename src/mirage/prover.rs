@@ -3,7 +3,7 @@ use std::ops::{AddAssign, MulAssign};
 use std::sync::Arc;
 
 use ff::{Field, PrimeField, PrimeFieldBits};
-use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
+use group::{prime::PrimeCurveAffine, Group, Curve, UncompressedEncoding};
 use merlin::Transcript;
 use pairing::Engine;
 
@@ -19,6 +19,7 @@ use crate::domain::{EvaluationDomain, Scalar};
 use crate::multiexp::{multiexp, DensityTracker, FullDensity};
 
 use crate::multicore::Worker;
+use crate::{start_timer, end_timer};
 
 fn eval<S: PrimeField>(
     lc: &LinearCombination<S>,
@@ -199,6 +200,7 @@ where
         Ok((var, Some(value)))
     }
 
+    #[allow(unused_variables)]
     fn end_aux_block<A, AR>(&mut self, _annotation: A) -> Result<(), SynthesisError>
     where
         A: FnOnce() -> AR,
@@ -211,7 +213,7 @@ where
         assert!(end > start);
         self.aux_blocks
             .push(self.aux_assignment[start..end].to_vec());
-        let aux_assignment = Arc::new(
+        let aux_assignment: Arc<Vec<E::Fr>> = Arc::new(
             self.aux_assignment[start..end]
                 .into_iter()
                 .map(|s| s.clone().into())
@@ -295,7 +297,10 @@ where
 
     prover.alloc_input(|| "", || Ok(E::Fr::one()))?;
 
+    let t_synth = start_timer!(|| "synthesis");
     circuit.synthesize(&mut prover)?;
+    end_timer!(t_synth);
+    let t_nosynth = start_timer!(|| "post-synth");
 
     for i in 0..prover.input_assignment.len() {
         prover.enforce(|| "", |lc| lc + Variable(Index::Input(i)), |lc| lc, |lc| lc);
@@ -303,7 +308,9 @@ where
 
     let worker = Worker::new();
 
+    let t_h = start_timer!(|| "h commit");
     let h = {
+        let t_h_coeffs = start_timer!(|| "h coeffs");
         let mut a = EvaluationDomain::from_coeffs(prover.a)?;
         let mut b = EvaluationDomain::from_coeffs(prover.b)?;
         let mut c = EvaluationDomain::from_coeffs(prover.c)?;
@@ -325,9 +332,12 @@ where
         a.truncate(a_len);
         // TODO: parallelize if it's even helpful
         let a = Arc::new(a.into_iter().map(|s| s.0.into()).collect::<Vec<_>>());
+        end_timer!(t_h_coeffs);
 
         multiexp(&worker, prover.params.get_h(a.len())?, FullDensity, a)
     };
+    end_timer!(t_h);
+    let t = start_timer!(|| "msm setup");
 
     // TODO: parallelize if it's even helpful
     let input_assignment = Arc::new(
@@ -424,6 +434,8 @@ where
             return Err(SynthesisError::UnexpectedIdentity);
         }
     }
+    end_timer!(t);
+    let t = start_timer!(|| "pre-msm wait");
 
     let last = vk.deltas_g1.len() - 1;
     let mut g_a = vk.deltas_g1[last] * r;
@@ -436,12 +448,16 @@ where
         rs.mul_assign(&s);
 
         g_c = vk.deltas_g1[last] * rs;
+        let tf = start_timer!(|| "mirage extra group fold");
         for i in 0..kappa_3s.len() {
             AddAssign::<&E::G1>::add_assign(&mut g_c, &(-vk.deltas_g1[i] * kappa_3s[i]));
         }
+        end_timer!(tf);
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.alpha_g1 * s));
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.beta_g1 * r));
     }
+    end_timer!(t);
+    let t = start_timer!(|| "wait for MSMs and fold");
     let mut a_answer = a_inputs.wait()?;
     AddAssign::<&E::G1>::add_assign(&mut a_answer, &a_aux.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_a, &a_answer);
@@ -458,8 +474,9 @@ where
     AddAssign::<&E::G1>::add_assign(&mut g_c, &b1_answer);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &h.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &l.wait()?);
+    end_timer!(t);
 
-    Ok((
+    let r = Ok((
         Proof {
             a: g_a.to_affine(),
             b: g_b.to_affine(),
@@ -467,5 +484,7 @@ where
             ds: prover.pi_ds,
         },
         prover.aux_blocks,
-    ))
+    ));
+    end_timer!(t_nosynth);
+    r
 }

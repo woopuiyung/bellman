@@ -187,6 +187,10 @@ impl<S: PrimeField, G: Group<S>> EvaluationDomain<S, G> {
             }
         });
     }
+
+    pub fn len(&self) -> usize {
+        2 << self.exp
+    }
 }
 
 pub trait Group<Scalar: PrimeField>: Sized + Copy + Clone + Send + Sync {

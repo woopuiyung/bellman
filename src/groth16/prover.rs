@@ -15,6 +15,7 @@ use crate::domain::{EvaluationDomain, Scalar};
 use crate::multiexp::{multiexp, DensityTracker, FullDensity};
 
 use crate::multicore::Worker;
+use crate::{start_timer, end_timer};
 
 fn eval<S: PrimeField>(
     lc: &LinearCombination<S>,
@@ -199,7 +200,10 @@ where
 
     prover.alloc_input(|| "", || Ok(E::Fr::one()))?;
 
+    let t_synth = start_timer!(|| "synthesis");
     circuit.synthesize(&mut prover)?;
+    end_timer!(t_synth);
+    let t_nosynth = start_timer!(|| "post-synth");
 
     for i in 0..prover.input_assignment.len() {
         prover.enforce(|| "", |lc| lc + Variable(Index::Input(i)), |lc| lc, |lc| lc);
@@ -209,10 +213,13 @@ where
 
     let vk = params.get_vk(prover.input_assignment.len())?;
 
+    let t_h = start_timer!(|| "h commit");
     let h = {
+        let t_h_coeffs = start_timer!(|| "h coeffs");
         let mut a = EvaluationDomain::from_coeffs(prover.a)?;
         let mut b = EvaluationDomain::from_coeffs(prover.b)?;
         let mut c = EvaluationDomain::from_coeffs(prover.c)?;
+        println!("MSM/FFT domain size {}", a.len());
         a.ifft(&worker);
         a.coset_fft(&worker);
         b.ifft(&worker);
@@ -231,9 +238,12 @@ where
         a.truncate(a_len);
         // TODO: parallelize if it's even helpful
         let a = Arc::new(a.into_iter().map(|s| s.0.into()).collect::<Vec<_>>());
+        end_timer!(t_h_coeffs);
 
         multiexp(&worker, params.get_h(a.len())?, FullDensity, a)
     };
+    end_timer!(t_h);
+    let t = start_timer!(|| "msm setup");
 
     // TODO: parallelize if it's even helpful
     let input_assignment = Arc::new(
@@ -313,6 +323,8 @@ where
         // subversion-CRS attack.
         return Err(SynthesisError::UnexpectedIdentity);
     }
+    end_timer!(t);
+    let t = start_timer!(|| "pre-msm wait");
 
     let mut g_a = vk.delta_g1 * r;
     AddAssign::<&E::G1Affine>::add_assign(&mut g_a, &vk.alpha_g1);
@@ -327,6 +339,8 @@ where
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.alpha_g1 * s));
         AddAssign::<&E::G1>::add_assign(&mut g_c, &(vk.beta_g1 * r));
     }
+    end_timer!(t);
+    let t = start_timer!(|| "wait for MSMs and fold");
     let mut a_answer = a_inputs.wait()?;
     AddAssign::<&E::G1>::add_assign(&mut a_answer, &a_aux.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_a, &a_answer);
@@ -343,10 +357,13 @@ where
     AddAssign::<&E::G1>::add_assign(&mut g_c, &b1_answer);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &h.wait()?);
     AddAssign::<&E::G1>::add_assign(&mut g_c, &l.wait()?);
+    end_timer!(t);
 
-    Ok(Proof {
+    let r = Ok(Proof {
         a: g_a.to_affine(),
         b: g_b.to_affine(),
         c: g_c.to_affine(),
-    })
+    });
+    end_timer!(t_nosynth);
+    r
 }
