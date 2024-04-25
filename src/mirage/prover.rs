@@ -3,7 +3,7 @@ use std::ops::{AddAssign, MulAssign};
 use std::sync::Arc;
 
 use ff::{Field, PrimeField, PrimeFieldBits};
-use group::{prime::PrimeCurveAffine, Group, Curve, UncompressedEncoding};
+use group::{prime::PrimeCurveAffine, Curve, UncompressedEncoding};
 use merlin::Transcript;
 use pairing::Engine;
 
@@ -213,7 +213,7 @@ where
         assert!(end > start);
         self.aux_blocks
             .push(self.aux_assignment[start..end].to_vec());
-        let aux_assignment: Arc<Vec<E::Fr>> = Arc::new(
+        let aux_assignment: Arc<Vec<_>> = Arc::new(
             self.aux_assignment[start..end]
                 .into_iter()
                 .map(|s| s.clone().into())
